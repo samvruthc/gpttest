@@ -1,0 +1,455 @@
+# ORION — Full Updated Frontend HTML
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ORION — Autonomous Financial Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+
+<style>
+/* KEEP ALL YOUR EXISTING CSS EXACTLY THE SAME */
+</style>
+</head>
+
+<body class="min-h-screen grain">
+
+<!-- KEEP ALL YOUR EXISTING HTML EXACTLY THE SAME -->
+
+<script>
+
+const API = "https://1orionmax-production.up.railway.app/api";
+
+let UNIVERSE = [];
+let SELECTED = null;
+let PRICE_CHART = null;
+let CURRENT_RANGE = '6mo';
+
+const $ = (id) => document.getElementById(id);
+
+const fmt = (n, d=2) =>
+  (n===null||n===undefined||Number.isNaN(n))
+    ? '—'
+    : Number(n).toLocaleString(undefined,{
+        minimumFractionDigits:d,
+        maximumFractionDigits:d
+      });
+
+const fmtCompact = (n) => {
+  if (n==null) return '—';
+
+  const a=Math.abs(n);
+
+  if(a>=1e12) return (n/1e12).toFixed(2)+'T';
+  if(a>=1e9) return (n/1e9).toFixed(2)+'B';
+  if(a>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(a>=1e3) return (n/1e3).toFixed(2)+'K';
+
+  return n.toFixed(0);
+};
+
+const clsChange = (n) => n>=0 ? 'ticker-up' : 'ticker-dn';
+const sign = (n) => (n>=0?'+':'') + fmt(n,2);
+
+function clock(){
+  const d = new Date();
+  $('clock').textContent = d.toUTCString().replace('GMT','UTC');
+}
+
+setInterval(clock, 1000);
+clock();
+
+async function getJSON(url){
+  const r = await fetch(url, {
+    headers:{'Accept':'application/json'}
+  });
+
+  if(!r.ok) throw new Error(`${r.status} ${url}`);
+
+  return r.json();
+}
+
+// ---------------- INIT ----------------
+
+async function init(){
+
+  try{
+
+    const u = await getJSON(`${API}/orion/universe`);
+
+    UNIVERSE = u.companies;
+
+    $('universe-count').textContent =
+      UNIVERSE.length + ' tickers';
+
+    renderWatchlist();
+
+    SELECTED =
+      UNIVERSE.find(c=>c.ticker==='NVDA') || UNIVERSE[0];
+
+    await Promise.all([
+      loadTape(),
+      loadDashboard(SELECTED.ticker),
+      pollAgents(),
+      loadNews()
+    ]);
+
+  } catch(e){
+
+    console.error(e);
+
+    $('agent-stream').innerHTML =
+      `<div class="text-rose-400">Backend unavailable: ${e.message}</div>`;
+  }
+
+  setInterval(loadTape, 25000);
+  setInterval(pollAgents, 5000);
+  setInterval(()=> SELECTED && refreshQuote(SELECTED.ticker), 20000);
+}
+
+// ---------------- TAPE ----------------
+
+async function loadTape(){
+
+  try{
+
+    const tickers = UNIVERSE.map(c=>c.ticker).join(',');
+
+    const {quotes} =
+      await getJSON(`${API}/orion/quotes?tickers=${tickers}`);
+
+    const segs = quotes
+      .filter(q=>q.price != null)
+      .map(q=>`
+        <span class="inline-flex items-center gap-2">
+          <span class="text-slate-300">${q.ticker}</span>
+          <span class="text-slate-100">${fmt(q.price,2)}</span>
+          <span class="${clsChange(q.changePct||0)}">
+            ${(q.changePct||0).toFixed(2)}%
+          </span>
+        </span>
+      `)
+      .join('<span class="text-slate-700">·</span>');
+
+    $('tape').innerHTML = segs + segs;
+
+  } catch(e){
+
+    console.warn('tape',e);
+
+  }
+}
+
+// ---------------- WATCHLIST ----------------
+
+function renderWatchlist(){
+
+  $('watchlist').innerHTML = UNIVERSE.map(c => `
+
+    <button
+      data-t="${c.ticker}"
+      class="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-md hover:bg-white/[0.04] transition group"
+    >
+
+      <div class="text-left">
+        <div class="font-mono text-[12px]">${c.ticker}</div>
+        <div class="text-[10px] text-slate-500 truncate max-w-[180px]">${c.name}</div>
+      </div>
+
+      <div class="text-right font-mono text-[11px]" id="wl-${c.ticker}">
+        —
+      </div>
+
+    </button>
+
+  `).join('');
+
+  $('watchlist')
+    .querySelectorAll('button[data-t]')
+    .forEach(b=>{
+      b.addEventListener('click', ()=> select(b.dataset.t));
+    });
+
+  refreshWatchlistPrices();
+}
+
+// ---------------- FIXED WATCHLIST PRICES ----------------
+
+async function refreshWatchlistPrices(){
+
+  try {
+
+    const tickers = UNIVERSE.map(c=>c.ticker).join(',');
+
+    const r = await fetch(
+      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${tickers}&fields=regularMarketPrice,regularMarketChangePercent`,
+      { headers: { Accept: 'application/json' } }
+    );
+
+    const json = await r.json();
+
+    const results = json?.quoteResponse?.result || [];
+
+    results.forEach(q => {
+
+      const el = $(`wl-${q.symbol}`);
+
+      const price = q.regularMarketPrice;
+      const chgPct = q.regularMarketChangePercent;
+
+      if (!el) return;
+
+      el.innerHTML = `
+        <div>
+          ${price != null ? fmt(price, 2) : '—'}
+        </div>
+
+        <div class="${
+          chgPct != null
+            ? clsChange(chgPct)
+            : 'text-slate-500'
+        } text-[10px]">
+
+          ${
+            chgPct != null
+              ? `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`
+              : '—'
+          }
+
+        </div>
+      `;
+
+    });
+
+  } catch(e) {
+
+    console.warn(e);
+
+  }
+}
+
+function select(ticker){
+
+  SELECTED = UNIVERSE.find(c=>c.ticker===ticker);
+
+  if(!SELECTED) return;
+
+  loadDashboard(ticker);
+  loadNews(ticker);
+}
+
+// ---------------- FIXED DASHBOARD ----------------
+
+async function loadDashboard(ticker){
+
+  $('sel-ticker').textContent = ticker;
+
+  $('sel-name').textContent =
+    (UNIVERSE.find(c=>c.ticker===ticker)||{}).name || '';
+
+  $('sel-sector').textContent =
+    (UNIVERSE.find(c=>c.ticker===ticker)||{}).sector || '';
+
+  try{
+
+    const d = await getJSON(`${API}/orion/dashboard/${ticker}`);
+
+    // PRIORITIZE browser-side Yahoo data
+    await browserQuote(ticker);
+
+    // fallback if browser quote fails
+    if (
+      !$('sel-price').textContent ||
+      $('sel-price').textContent === '—'
+    ) {
+      renderQuote(d.quote);
+    }
+
+    renderChart(d.chart);
+    renderSignals(d.signals);
+    renderFilings(d.filings);
+
+  } catch(e) {
+
+    console.error(e);
+
+  }
+}
+
+async function refreshQuote(ticker){
+
+  try {
+
+    const q = await getJSON(`${API}/orion/quote/${ticker}`);
+
+    renderQuote(q);
+
+  } catch(e) {}
+
+  refreshWatchlistPrices();
+}
+
+// ---------------- FIXED QUOTE RENDER ----------------
+
+function renderQuote(q){
+
+  const hasPrice = q.price != null;
+  const hasChange = q.change != null;
+  const hasChangePct = q.changePct != null;
+
+  $('sel-price').textContent =
+    hasPrice ? fmt(q.price,2) : '—';
+
+  if(hasChange && hasChangePct){
+
+    $('sel-change').className =
+      `font-mono text-sm ${clsChange(q.changePct)}`;
+
+    $('sel-change').textContent =
+      `${sign(q.change)} (${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}%)`;
+
+  } else {
+
+    $('sel-change').className =
+      'font-mono text-sm text-slate-500';
+
+    $('sel-change').textContent = '—';
+
+  }
+
+  $('sel-mcap').textContent =
+    q.marketCap != null ? fmtCompact(q.marketCap) : '—';
+
+  $('sel-pe').textContent =
+    q.peRatio != null ? q.peRatio.toFixed(1) : '—';
+
+  $('sel-range').textContent =
+    q.fiftyTwoWeekLow != null && q.fiftyTwoWeekHigh != null
+      ? `${fmt(q.fiftyTwoWeekLow,2)} – ${fmt(q.fiftyTwoWeekHigh,2)}`
+      : '—';
+
+  $('sel-vol').textContent =
+    q.volume != null ? fmtCompact(q.volume) : '—';
+}
+
+// KEEP ALL YOUR OTHER EXISTING FUNCTIONS EXACTLY THE SAME
+
+// ---------------- FIXED BROWSER QUOTE ----------------
+
+async function browserQuote(ticker) {
+
+  try {
+
+    const r = await fetch(
+      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ticker}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketVolume,marketCap,trailingPE,fiftyTwoWeekHigh,fiftyTwoWeekLow,shortName,longName`,
+      {
+        headers: {
+          Accept: 'application/json'
+        }
+      }
+    );
+
+    const json = await r.json();
+
+    const q = json?.quoteResponse?.result?.[0];
+
+    if (!q) return;
+
+    const price = q.regularMarketPrice;
+    const chg = q.regularMarketChange;
+    const chgPct = q.regularMarketChangePercent;
+
+    $('sel-price').textContent =
+      price != null
+        ? fmt(price, 2)
+        : '—';
+
+    $('sel-mcap').textContent =
+      q.marketCap != null
+        ? fmtCompact(q.marketCap)
+        : '—';
+
+    $('sel-pe').textContent =
+      q.trailingPE != null
+        ? q.trailingPE.toFixed(1)
+        : '—';
+
+    $('sel-vol').textContent =
+      q.regularMarketVolume != null
+        ? fmtCompact(q.regularMarketVolume)
+        : '—';
+
+    $('sel-range').textContent =
+      q.fiftyTwoWeekLow != null &&
+      q.fiftyTwoWeekHigh != null
+        ? `${fmt(q.fiftyTwoWeekLow, 2)} – ${fmt(q.fiftyTwoWeekHigh, 2)}`
+        : '—';
+
+    $('sel-name').textContent =
+      q.longName || q.shortName || ticker;
+
+    if (chg != null && chgPct != null) {
+
+      $('sel-change').textContent =
+        `${chg >= 0 ? '+' : ''}${fmt(chg, 2)} (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`;
+
+      $('sel-change').className =
+        `font-mono text-sm ${clsChange(chgPct)}`;
+
+    } else {
+
+      $('sel-change').textContent = '—';
+
+      $('sel-change').className =
+        'font-mono text-sm text-slate-500';
+
+    }
+
+    // Update watchlist row too
+    const wlEl = $(`wl-${ticker}`);
+
+    if (wlEl) {
+
+      wlEl.innerHTML = `
+        <div>
+          ${price != null ? fmt(price, 2) : '—'}
+        </div>
+
+        <div class="${
+          chgPct != null
+            ? clsChange(chgPct)
+            : 'text-slate-500'
+        } text-[10px]">
+
+          ${
+            chgPct != null
+              ? `${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%`
+              : '—'
+          }
+
+        </div>
+      `;
+    }
+
+  } catch(e) {
+
+    console.warn('browserQuote failed:', e.message);
+
+  }
+}
+
+window.addEventListener('DOMContentLoaded', ()=>{
+  lucide.createIcons();
+  init();
+});
+
+</script>
+</body>
+</html>
